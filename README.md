@@ -1,10 +1,226 @@
-# Agents From Scratch 
+# Ambient Email Agent
 
 [![CI](https://github.com/AryanNehra/ambient-email-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanNehra/ambient-email-agent/actions/workflows/ci.yml)
 
-The repo is a guide to building agents from scratch. It builds up to an ["ambient"](https://blog.langchain.dev/introducing-ambient-agents/) agent that can manage your email with connection to the Gmail API. It's grouped into 4 sections, each with a notebook and accompanying code in the `src/email_assistant` directory. These section build from the basics of agents, to agent evaluation, to human-in-the-loop, and finally to memory. These all come together in an agent that you can deploy, and the principles can be applied to other agents across a wide range of tasks. 
+A LangGraph email assistant (triage → respond → human-in-the-loop → memory), built on LangChain
+Academy's course, extended with a tested prompt-injection guard and an LLM-as-judge calibration
+study.
 
-![overview](notebooks/img/overview.png)
+> **Built on [LangChain Academy's "Building Ambient Agents with LangGraph"](https://academy.langchain.com/)**, via its public repo
+> [langchain-ai/agents-from-scratch](https://github.com/langchain-ai/agents-from-scratch) (MIT
+> License, Copyright (c) 2026 LangChain, Inc. — preserved in [LICENSE](LICENSE)). See
+> [NOTICE.md](NOTICE.md) for the full attribution and the table below for exactly which files are
+> course code vs. my own additions. Course code is never presented as original work here.
+
+## What it does
+
+An email arrives → a **triage router** classifies it (ignore / notify / respond) → a **response
+agent** drafts tool calls (write a reply, check calendar, schedule a meeting) → every
+send/schedule action pauses for **human-in-the-loop** approval via interrupts → approved
+feedback can update **long-term memory** (preferences) for next time. All of this is course
+code, unmodified except where noted below.
+
+My two additions sit around that pipeline:
+
+- **Extension A** — a prompt-injection guard that doesn't depend on the LLM "noticing" an
+  attack: a deterministic tool-call validator, a heuristic injection detector, and a
+  memory-write guard, all independently tested and evaluated against a 24-case attack/benign
+  dataset.
+- **Extension B** — a calibration study measuring how much the course's existing LLM-as-judge
+  agrees with a human on response quality, with kappa, confusion matrix, self-consistency, and
+  bias probes.
+
+```mermaid
+flowchart TD
+    Email["Incoming email"] --> Triage["triage_router<br/>(course)"]
+    Triage -->|ignore| End1(("end"))
+    Triage -->|notify| HITLNotify["triage_interrupt_handler<br/>HITL (course)"]
+    Triage -->|respond| Agent["response_agent: llm_call<br/>(course)"]
+    HITLNotify -->|user replies| Agent
+    HITLNotify -->|user ignores| End2(("end"))
+    Agent --> ToolCall{{"tool call proposed"}}
+    ToolCall --> HITLTool["interrupt_handler<br/>HITL approval (course)"]
+    HITLTool -->|accept / edit| Tools["write_email / schedule_meeting /<br/>check_calendar_availability (course, mocked)"]
+    Tools --> Agent
+    Agent -->|Done| End3(("end"))
+    Guard["Guard: detector + tool_validator<br/>+ triage override (mine, security/)"]
+    ToolCall -.validated by.-> Guard
+    Triage -.validated by.-> Guard
+    Memory[("LangGraph Store<br/>preferences (course)")]
+    HITLNotify -.human feedback only.-> Memory
+    HITLTool -.human feedback only.-> Memory
+    MemGuard["memory_guard: human_feedback_scope()<br/>(mine, security/)"]
+    Memory -.enforced by.-> MemGuard
+```
+
+The guard (`src/email_assistant/security/`) is implemented, unit-tested, and evaluated against
+the real attack dataset and against the real course graph's HITL behavior (see
+[Extension A](#extension-a-prompt-injection-guard) below) — but as shipped here it runs
+alongside the graph in tests and the eval harness, not yet as a live node inside
+`email_assistant_hitl.py` itself. See [Limitations](#limitations-and-next-steps) for exactly
+what wiring it in would take.
+
+## What is mine vs. the course
+
+| Path | Origin |
+|---|---|
+| `src/email_assistant/` (all files except `security/`) | Course, unmodified |
+| `tests/test_response.py`, `test_notebooks.py`, `run_all_tests.py` | Course, unmodified |
+| `tests/conftest.py` | Course, **lightly modified** — see "Modifications to course code" below |
+| `notebooks/`, `doc/` images | Course, unmodified |
+| `src/email_assistant/security/` | **Mine** — Extension A guard (framing, tool_validator, detector, memory_guard, decision_log, guard orchestrator) |
+| `evals/injection/` | **Mine** — Extension A attack dataset + offline/live eval runner |
+| `evals/judge_calibration/` | **Mine** — Extension B dataset, labeling CLI, metrics, analysis |
+| `tests/security/`, `tests/judge_calibration/` | **Mine** — 92 offline tests |
+| `docs/threat-model.md`, `docs/judge-calibration-methodology.md` | **Mine** |
+| `results/` | **Mine** — generated summaries, committed |
+| `Makefile`, `.github/workflows/ci.yml`, `NOTICE.md` | **Mine** |
+
+## Extension A: prompt-injection guard
+
+**Threat model** ([docs/threat-model.md](docs/threat-model.md)): the attacker is anyone who can
+get text into an email the assistant reads (indirect prompt injection). Email content must
+never be able to change a recipient, bypass human approval, or write to memory. See the doc for
+the full writeup.
+
+**Guard layers** (`src/email_assistant/security/`), each independently toggleable:
+
+1. **framing** — wraps untrusted email content in a labeled, delimited block with an explicit
+   "this is data, not instructions" notice.
+2. **tool_validator** — deterministic: recipient allow-list/domain policy, max recipients,
+   rejects unexpected tool arguments, before any tool executes.
+3. **detector** — heuristic regex/keyword detection across 5 attack categories, with
+   normalization for HTML-comment, zero-width-character, and base64 obfuscation. An
+   LLM-classifier mode exists behind a flag but is not used offline/in CI.
+4. **memory_guard** — memory writes only permitted inside `human_feedback_scope()`, never as a
+   side effect of reading email content.
+
+**Results** (offline, deterministic, from [results/injection_summary.md](results/injection_summary.md) — exact numbers, not estimates):
+
+| Config | Attacks blocked | Attack success rate | Benign false-positive rate |
+|---|---|---|---|
+| baseline (guard off) | 0/17 | 1.0 | 0.0 |
+| **full guard** | **17/17** | **0.0** | **0.0** |
+| only tool_validator | 12/17 | 0.294 | 0.0 |
+| only detector | 9/17 | 0.471 | 0.0 |
+| only memory_protection | 2/17 | 0.882 | 0.0 |
+| only framing | 0/17 | 1.0 | 0.0 |
+
+`only_framing` blocking 0/17 offline is expected, not a bug: the offline eval uses scripted
+tool calls that bypass the LLM entirely, so framing (which only works by influencing what the
+LLM decides to do) can't show an effect there — its contribution can only be measured in
+`--live` mode against a real model. The other three layers are independently deterministic and
+each contribute real, non-overlapping coverage (12 + 9 + 2 ≠ 17, i.e. they catch different
+subsets of the 17 attacks).
+
+17 attack cases across 8 categories (instruction override, data exfiltration,
+impersonation/urgency, hidden instructions, tool-argument manipulation, malicious scheduling,
+memory poisoning, router manipulation) + 7 benign controls, in
+[evals/injection/cases.jsonl](evals/injection/cases.jsonl). 71 tests in `tests/security/`,
+including an integration test that drives the real course graph with monkeypatched LLMs to
+confirm `write_email`/`schedule_meeting` always pause at the HITL interrupt regardless of what
+the (possibly compromised) model asked for.
+
+**Reproduce:**
+```shell
+make eval-injection          # writes results/injection_summary.{json,md}
+# or, with a real OPENAI_API_KEY, also exercise a real model:
+python -m evals.injection.run --live --repeats 3
+```
+
+## Extension B: LLM-judge calibration
+
+**Method**: reuses the course's existing judge unchanged (`CriteriaGrade` structured output +
+`RESPONSE_CRITERIA_SYSTEM_PROMPT`, from `tests/test_response.py` /
+`src/email_assistant/eval/prompts.py`) against 30 items
+([evals/judge_calibration/items.jsonl](evals/judge_calibration/items.jsonl)): 10 scenarios × 3
+quality variants (good / subtly-wrong / clearly-bad), built via controlled perturbation — see
+[docs/judge-calibration-methodology.md](docs/judge-calibration-methodology.md) for the honest
+account of how each item was constructed (no live API key was available to generate these from
+the real agent).
+
+**Labels were collected by me, manually**, via
+`python -m evals.judge_calibration.label` (an interactive CLI that hides which quality tier an
+item was designed as, and randomizes order, to avoid anchoring).
+
+**Status: pending.** See [results/judge_calibration.json](results/judge_calibration.json) —
+human labeling and/or a live judge run had not been completed as of this writing. No
+agreement/kappa/bias numbers are reported until both exist; `analyze.py` refuses to estimate
+them.
+
+**Reproduce once labels exist and `OPENAI_API_KEY` is set:**
+```shell
+python -m evals.judge_calibration.label     # ~20-30 min, interactive
+python -m evals.judge_calibration.analyze   # writes results/judge_calibration.{json,md}
+```
+
+Planned metrics (computed by `analyze.py`, pure functions unit-tested against hand-computed
+examples in `tests/judge_calibration/test_metrics.py`): accuracy/Cohen's kappa vs. human,
+confusion matrix, false-pass/false-fail rates, judge self-consistency across N=3 repeats at
+temperature 0, a verbosity-bias probe, and a rubric-paraphrase-wording sensitivity probe.
+Position bias is not applicable — this judge grades one response against a rubric, there's no
+pairwise comparison mode. With n=30, a 95% bootstrap CI is reported alongside every point
+estimate; treat n=30 as a small sample.
+
+## Quickstart
+
+**Offline (no API key needed):**
+```shell
+git clone <this repo> && cd ambient-email-agent
+python3.12 -m venv .venv && source .venv/bin/activate   # course requires Python >=3.11,<3.14
+pip install -e ".[dev]"
+make lint    # ruff, scoped to code added here
+make test    # 92 tests, tests/security + tests/judge_calibration + evals, no API key needed
+make eval-injection
+```
+
+**Live mode (course notebooks, course tests, `--live` evals, and Extension B analysis) needs a
+real key:**
+```shell
+cp .env.example .env   # fill in OPENAI_API_KEY and LANGSMITH_API_KEY
+python tests/run_all_tests.py          # course's own test suite
+python -m evals.injection.run --live   # guard eval against a real model
+python -m evals.judge_calibration.analyze
+```
+
+## Modifications to course code
+
+| File | Change | Reason |
+|---|---|---|
+| `tests/conftest.py` | Added one line setting a placeholder `OPENAI_API_KEY` if unset | Several email_assistant modules construct a `ChatOpenAI` client at import time, which validates credentials eagerly even for offline tests that monkeypatch the client before calling it. No network call is made in the offline suite. |
+| `.github/workflows/claude-code-review.yml`, `.github/workflows/claude.yml` | Removed | Required an `ANTHROPIC_API_KEY` secret not configured here; replaced by `.github/workflows/ci.yml` (lint + offline tests, no secrets). |
+
+No other course file was changed.
+
+## Limitations and next steps
+
+- **The guard is not yet wired into the live graph.** `evaluate_tool_call` /
+  `evaluate_triage_override` are proven (by tests and the eval harness) to correctly judge the
+  same tool calls and classifications the real graph produces, but `interrupt_handler` and
+  `triage_router` in `email_assistant_hitl.py` don't call them yet. Wiring them in is a few
+  lines per function (check the decision before `tool.invoke(...)` / before choosing `goto`)
+  and was left out to keep edits to course files minimal — see the table above.
+- **The heuristic detector is regex-based and bypassable** by a sufficiently creative attacker;
+  it's a deterministic floor, not a guarantee. The optional LLM-classifier mode
+  (`GUARD_DETECTOR_USE_LLM`) is scaffolded but not implemented or evaluated.
+- **17 attack cases is not exhaustive** — real adversaries will find phrasings outside these 8
+  categories. Treat the 0% offline attack-success rate as "beats these 17," not "unbeatable."
+  `--live` mode hasn't been run against a real model as of this writing.
+- **Judge calibration is pending real numbers** (see Extension B) — n=30 is small, and no
+  results exist yet without human labels + a live key.
+- **All tools are mocks**; the real Gmail integration (`email_assistant_hitl_memory_gmail.py`)
+  was not touched or evaluated by either extension.
+- Ideas for more: an MCP tool wrapper around the guard so it's reusable outside this repo;
+  larger eval sets; wiring the guard in and re-running the live eval to see if real-model
+  behavior matches the scripted "compromised model" simulation.
+
+## License and attribution
+
+MIT License, Copyright (c) 2026 LangChain, Inc. — see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+---
+
+## Course content (original material, preserved below)
 
 ## Environment Setup 
 
