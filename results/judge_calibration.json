@@ -1,0 +1,4 @@
+{
+  "status": "pending",
+  "reason": "No human labels yet. Run `python -m evals.judge_calibration.label` (about 20-30 minutes) and re-run this script after."
+}
