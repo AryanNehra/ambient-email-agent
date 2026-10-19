@@ -63,3 +63,8 @@ lint.ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.pytest.ini_options]
+markers = [
+    "live: tests/evals that call a real LLM API (requires OPENAI_API_KEY); skipped unless --live is passed",
+]

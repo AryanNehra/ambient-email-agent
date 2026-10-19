@@ -60,3 +60,6 @@ htmlcov/
 .env.test.local
 .env.production.local
 .langgraph_api
+
+# Raw eval traces (can be large / contain full prompts); committed summaries live in results/*.json and *.md
+results/raw/
